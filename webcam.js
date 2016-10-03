@@ -1,16 +1,40 @@
-// WebcamJS v1.0.6
+// WebcamJS v1.0.16
 // Webcam library for capturing JPEG/PNG images in JavaScript
 // Attempts getUserMedia, falls back to Flash
 // Author: Joseph Huckaby: http://github.com/jhuckaby
 // Based on JPEGCam: http://code.google.com/p/jpegcam/
-// Copyright (c) 2012 - 2015 Joseph Huckaby
+// Copyright (c) 2012 - 2016 Joseph Huckaby
 // Licensed under the MIT License
 
 (function(window) {
 var _userMedia;
 
+// declare error types
+
+// inheritance pattern here:
+// https://stackoverflow.com/questions/783818/how-do-i-create-a-custom-error-in-javascript
+function FlashError() {
+	var temp = Error.apply(this, arguments);
+	temp.name = this.name = "FlashError";
+	this.stack = temp.stack;
+	this.message = temp.message;
+}
+
+function WebcamError() {
+	var temp = Error.apply(this, arguments);
+	temp.name = this.name = "WebcamError";
+	this.stack = temp.stack;
+	this.message = temp.message;
+}
+
+IntermediateInheritor = function() {};
+IntermediateInheritor.prototype = Error.prototype;
+
+FlashError.prototype = new IntermediateInheritor();
+WebcamError.prototype = new IntermediateInheritor();
+
 var Webcam = {
-	version: '1.0.6',
+	version: '1.0.16',
 	
 	// globals
 	protocol: location.protocol.match(/https/i) ? 'https' : 'http',
@@ -25,13 +49,21 @@ var Webcam = {
 		dest_height: 0,        // these default to width/height
 		image_format: 'jpeg',  // image format (may be jpeg or png)
 		jpeg_quality: 90,      // jpeg image quality from 0 (worst) to 100 (best)
+		enable_flash: true,    // enable flash fallback,
 		force_flash: false,    // force flash mode,
 		flip_horiz: false,     // flip image horiz (mirror mode)
 		fps: 30,               // camera frames per second
 		upload_name: 'webcam', // name of file in upload post data
 		constraints: null,     // custom user media constraints,
 		swfURL: '',            // URI to webcam.swf movie (defaults to the js location)
-		flashNotDetectedText: 'ERROR: No Adobe Flash Player detected.  Webcam.js relies on Flash for browsers that do not support getUserMedia (like yours).'
+		flashNotDetectedText: 'ERROR: No Adobe Flash Player detected.  Webcam.js relies on Flash for browsers that do not support getUserMedia (like yours).',
+		noInterfaceFoundText: 'No supported webcam interface found.',
+		unfreeze_snap: true    // Whether to unfreeze the camera after snap (defaults to true)
+	},
+
+	errors: {
+		FlashError: FlashError,
+		WebcamError: WebcamError
 	},
 	
 	hooks: {}, // callback hook functions
@@ -75,7 +107,7 @@ var Webcam = {
 			elem = document.getElementById(elem) || document.querySelector(elem);
 		}
 		if (!elem) {
-			return this.dispatch('error', "Could not locate DOM element to attach to.");
+			return this.dispatch('error', new WebcamError("Could not locate DOM element to attach to."));
 		}
 		this.container = elem;
 		elem.innerHTML = ''; // start with empty element
@@ -89,6 +121,11 @@ var Webcam = {
 		if (!this.params.width) this.params.width = elem.offsetWidth;
 		if (!this.params.height) this.params.height = elem.offsetHeight;
 		
+		// make sure we have a nonzero width and height at this point
+		if (!this.params.width || !this.params.height) {
+			return this.dispatch('error', new WebcamError("No width and/or height for webcam.  Please call set() first, or attach to a visible element."));
+		}
+		
 		// set defaults for dest_width / dest_height if not set
 		if (!this.params.dest_width) this.params.dest_width = this.params.width;
 		if (!this.params.dest_height) this.params.dest_height = this.params.height;
@@ -97,7 +134,7 @@ var Webcam = {
 		// if force_flash is set, disable userMedia
 		if (this.params.force_flash) {
 			_userMedia = this.userMedia;
-			this.userMedia = null
+			this.userMedia = null;
 		}
 		
 		// check for default fps
@@ -145,24 +182,36 @@ var Webcam = {
 			})
 			.then( function(stream) {
 				// got access, attach stream to video
+				video.onloadedmetadata = function(e) {
+					self.stream = stream;
+					self.loaded = true;
+					self.live = true;
+					self.dispatch('load');
+					self.dispatch('live');
+					self.flip();
+				};
 				video.src = window.URL.createObjectURL( stream ) || stream;
-				self.stream = stream;
-				self.loaded = true;
-				self.live = true;
-				self.dispatch('load');
-				self.dispatch('live');
-				self.flip();
 			})
 			.catch( function(err) {
-				return self.dispatch('error', "Could not access webcam: " + err.name + ": " + err.message, err);
+				// JH 2016-07-31 Instead of dispatching error, now falling back to Flash if userMedia fails (thx @john2014)
+				// JH 2016-08-07 But only if flash is actually installed -- if not, dispatch error here and now.
+				if (self.params.enable_flash && self.detectFlash()) {
+					setTimeout( function() { self.params.force_flash = 1; self.attach(elem); }, 1 );
+				}
+				else {
+					self.dispatch('error', err);
+				}
 			});
 		}
-		else {
+		else if (this.params.enable_flash && this.detectFlash()) {
 			// flash fallback
 			window.Webcam = Webcam; // needed for flash-to-js interface
 			var div = document.createElement('div');
 			div.innerHTML = this.getSWFHTML();
 			elem.appendChild( div );
+		}
+		else {
+			this.dispatch('error', new WebcamError( this.params.noInterfaceFoundText ));
 		}
 		
 		// setup final crop for live preview
@@ -209,7 +258,8 @@ var Webcam = {
 
 		if (this.userMedia !== true) {
 			// call for turn off camera in flash
-			this.getMovie()._releaseCamera();
+			var movie = this.getMovie();
+			if (movie && movie._releaseCamera) movie._releaseCamera();
 		}
 
 		if (this.container) {
@@ -282,8 +332,15 @@ var Webcam = {
 			return true;
 		}
 		else if (name == 'error') {
+			if ((args[0] instanceof FlashError) || (args[0] instanceof WebcamError)) {
+				message = args[0].message;
+			} else {
+				message = "Could not access webcam: " + args[0].name + ": " + 
+					args[0].message + " " + args[0].toString();
+			}
+
 			// default error handler if no custom one specified
-			alert("Webcam.js Error: " + args[0]);
+			alert("Webcam.js Error: " + message);
 		}
 		
 		return false; // no hook defined
@@ -293,7 +350,6 @@ var Webcam = {
 		// for backward compatibility.
 		this.set('swfURL', value);
 	},
-	
 	
 	detectFlash: function() {
 		// return true if browser supports flash, false otherwise
@@ -332,13 +388,13 @@ var Webcam = {
 		
 		// make sure we aren't running locally (flash doesn't work)
 		if (location.protocol.match(/file/)) {
-			this.dispatch('error', "Flash does not work from local disk.  Please run from a web server.");
+			this.dispatch('error', new FlashError("Flash does not work from local disk.  Please run from a web server."));
 			return '<h3 style="color:red">ERROR: the Webcam.js Flash fallback does not work from local disk.  Please run it from a web server.</h3>';
 		}
 		
 		// make sure we have flash
 		if (!this.detectFlash()) {
-			this.dispatch('error', "Adobe Flash Player not found.  Please install from get.adobe.com/flashplayer and try again.");
+			this.dispatch('error', new FlashError("Adobe Flash Player not found.  Please install from get.adobe.com/flashplayer and try again."));
 			return '<h3 style="color:red">' + this.params.flashNotDetectedText + '</h3>';
 		}
 		
@@ -379,10 +435,10 @@ var Webcam = {
 	
 	getMovie: function() {
 		// get reference to movie object/embed in DOM
-		if (!this.loaded) return this.dispatch('error', "Flash Movie is not loaded yet");
+		if (!this.loaded) return this.dispatch('error', new FlashError("Flash Movie is not loaded yet"));
 		var movie = document.getElementById('webcam_movie_obj');
 		if (!movie || !movie._snap) movie = document.getElementById('webcam_movie_embed');
-		if (!movie) this.dispatch('error', "Cannot locate Flash movie in DOM");
+		if (!movie) this.dispatch('error', new FlashError("Cannot locate Flash movie in DOM"));
 		return movie;
 	},
 	
@@ -509,7 +565,7 @@ var Webcam = {
 		);
 		
 		// remove preview
-		this.unfreeze();
+		if (this.params.unfreeze_snap) this.unfreeze();
 	},
 	
 	snap: function(user_callback, user_canvas) {
@@ -517,9 +573,9 @@ var Webcam = {
 		var self = this;
 		var params = this.params;
 		
-		if (!this.loaded) return this.dispatch('error', "Webcam is not loaded yet");
-		// if (!this.live) return this.dispatch('error', "Webcam is not live yet");
-		if (!user_callback) return this.dispatch('error', "Please provide a callback function or canvas to snap()");
+		if (!this.loaded) return this.dispatch('error', new WebcamError("Webcam is not loaded yet"));
+		// if (!this.live) return this.dispatch('error', new WebcamError("Webcam is not live yet"));
+		if (!user_callback) return this.dispatch('error', new WebcamError("Please provide a callback function or canvas to snap()"));
 		
 		// if we have an active preview freeze, use that
 		if (this.preview_active) {
@@ -624,12 +680,11 @@ var Webcam = {
 				// camera is live and ready to snap
 				this.live = true;
 				this.dispatch('live');
-				this.flip();
 				break;
 
 			case 'error':
 				// Flash error
-				this.dispatch('error', msg);
+				this.dispatch('error', new FlashError(msg));
 				break;
 
 			default:
